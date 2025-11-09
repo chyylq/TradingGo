@@ -1,0 +1,6 @@
+# config files
+configs/*.local
+
+# pyc files
+**/*.pyc
+**/__pycache__

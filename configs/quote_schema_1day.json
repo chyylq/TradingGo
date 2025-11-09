@@ -1,0 +1,30 @@
+{
+  "timestamp": "date",
+  "open": "open",
+  "high": "high",
+  "low": "low",
+  "close": "close",
+  "volume": "volume",
+  "open_interest": "open_interest",
+  "metadata_fields": [],
+  "converters": {
+    "open": "float",
+    "high": "float",
+    "low": "float",
+    "close": "float",
+    "volume": "float",
+    "open_interest": "float"
+  },
+  "delimiter": ",",
+  "has_header": false,
+  "fieldnames": [
+    "date",
+    "open",
+    "high",
+    "low",
+    "close",
+    "volume",
+    "open_interest"
+  ]
+}
+

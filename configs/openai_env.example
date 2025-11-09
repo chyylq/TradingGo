@@ -1,0 +1,8 @@
+# Copy this file to `openai_env.local` (same directory) and populate with your secrets.
+# Do not commit files containing actual API keys or secrets.
+
+OPENAI_API_KEY=
+# Optional overrides:
+# OPENAI_API_BASE=https://api.openai.com/v1
+# OPENAI_MODEL=gpt-4.1-mini
+

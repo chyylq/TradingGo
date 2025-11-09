@@ -1,0 +1,20 @@
+{
+  "timestamp": "date",
+  "price": null,
+  "quantity": null,
+  "side": "direction",
+  "metadata_fields": [
+    "exit_date",
+    "strategy",
+    "underlying",
+    "tick",
+    "rtrn",
+    "signal_type"
+  ],
+  "converters": {
+    "rtrn": "percent",
+    "direction": "upper"
+  },
+  "delimiter": ","
+}
+
