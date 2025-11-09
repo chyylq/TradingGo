@@ -21,7 +21,9 @@ from .loaders import (
     FILL_LOADERS,
     QUOTE_LOADERS,
 )
+from .preprocess import filter_fills, preprocess_quotes
 from .env import load_openai_credentials
+from .datasets import StrategyDataset, load_strategy_dataset
 
 __all__ = [
     "FillRecord",
@@ -40,5 +42,9 @@ __all__ = [
     "FILL_LOADERS",
     "QUOTE_LOADERS",
     "load_openai_credentials",
+    "filter_fills",
+    "preprocess_quotes",
+    "StrategyDataset",
+    "load_strategy_dataset",
 ]
 

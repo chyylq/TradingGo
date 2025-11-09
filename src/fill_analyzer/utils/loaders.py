@@ -10,19 +10,20 @@ import logging
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
+import pandas as pd
+from pandas import DataFrame
+
 from .records import (
-    FillRecord,
     FillSchema,
     FillSourceConfig,
-    QuoteRecord,
     QuoteSchema,
     QuoteSourceConfig,
 )
 
 logger = logging.getLogger(__name__)
 
-FillLoader = Callable[[FillSourceConfig, FillSchema], List[FillRecord]]
-QuoteLoader = Callable[[QuoteSourceConfig, QuoteSchema], List[QuoteRecord]]
+FillLoader = Callable[[FillSourceConfig, FillSchema], DataFrame]
+QuoteLoader = Callable[[QuoteSourceConfig, QuoteSchema], DataFrame]
 
 FILL_LOADERS: Dict[str, FillLoader] = {}
 QUOTE_LOADERS: Dict[str, QuoteLoader] = {}
@@ -44,9 +45,9 @@ def register_quote_loader(name: str, loader: QuoteLoader) -> None:
     QUOTE_LOADERS[name] = loader
 
 
-def load_fills(config: FillSourceConfig) -> List[FillRecord]:
+def load_fills(config: FillSourceConfig) -> DataFrame:
     """
-    Load fills using the loader specified in the configuration.
+    Load fills using the loader specified in the configuration and return a DataFrame.
 
     A schema must be supplied either directly via `config.schema` or through
     a serialized schema file referenced by `config.schema_path`.
@@ -68,9 +69,9 @@ def load_fills(config: FillSourceConfig) -> List[FillRecord]:
     return loader(config, schema)
 
 
-def load_quotes(config: QuoteSourceConfig) -> List[QuoteRecord]:
+def load_quotes(config: QuoteSourceConfig) -> DataFrame:
     """
-    Load quotes using the configured loader and schema.
+    Load quotes using the configured loader and schema and return a DataFrame.
     """
 
     if config.schema is None and config.schema_path is None:
@@ -175,9 +176,9 @@ def _read_schema_payload(path: Optional[Path]) -> Dict[str, Any]:
 def _load_fills_from_csv(
     config: FillSourceConfig,
     schema: FillSchema,
-) -> List[FillRecord]:
+) -> DataFrame:
     """
-    Load raw fills from a CSV file and normalize into `FillRecord` objects.
+    Load raw fills from a CSV file and normalize into a DataFrame.
     """
 
     path = Path(config.source)
@@ -186,7 +187,7 @@ def _load_fills_from_csv(
 
     logger.info("Loading fills from %s", path)
 
-    records: List[FillRecord] = []
+    records: List[Dict[str, Any]] = []
     encoding = config.options.get("encoding", "utf-8")
     open_kwargs: Dict[str, Any] = {"encoding": encoding, "newline": ""}
     with path.open(**open_kwargs) as handle:
@@ -244,26 +245,31 @@ def _load_fills_from_csv(
                         row, field_name, schema.converters
                     )
 
-            records.append(
-                FillRecord(
-                    timestamp=str(timestamp_value),
-                    price=price_value,
-                    quantity=quantity_value,
-                    side=str(side_value) if side_value is not None else None,
-                    metadata=metadata,
-                )
-            )
+            row_data: Dict[str, Any] = {
+                "timestamp": str(timestamp_value),
+                "price": price_value,
+                "quantity": quantity_value,
+                "side": str(side_value) if side_value is not None else None,
+                "metadata": metadata,
+            }
+            row_data.update(metadata)
+            records.append(row_data)
 
-    logger.info("Loaded %d fills from %s", len(records), path)
-    return records
+    metadata_columns = metadata_fields if metadata_fields is not None else []
+    base_columns = ["timestamp", "price", "quantity", "side", "metadata"]
+    ordered_columns = list(dict.fromkeys(base_columns + metadata_columns))
+    dataframe = pd.DataFrame(records, columns=ordered_columns)
+
+    logger.info("Loaded %d fills from %s", len(dataframe), path)
+    return dataframe
 
 
 def _load_quotes_from_csv(
     config: QuoteSourceConfig,
     schema: QuoteSchema,
-) -> List[QuoteRecord]:
+) -> DataFrame:
     """
-    Load quotes from CSV-based data sources.
+    Load quotes from CSV-based data sources into a DataFrame.
     """
 
     path = Path(config.source)
@@ -272,7 +278,7 @@ def _load_quotes_from_csv(
 
     logger.info("Loading quotes from %s", path)
 
-    records: List[QuoteRecord] = []
+    records: List[Dict[str, Any]] = []
     encoding = config.options.get("encoding", "utf-8")
     open_kwargs: Dict[str, Any] = {"encoding": encoding, "newline": ""}
     with path.open(**open_kwargs) as handle:
@@ -349,21 +355,35 @@ def _load_quotes_from_csv(
                         row, field_name, schema.converters
                     )
 
-            records.append(
-                QuoteRecord(
-                    timestamp=str(timestamp_value),
-                    open=open_value,
-                    high=high_value,
-                    low=low_value,
-                    close=close_value,
-                    volume=volume_value,
-                    open_interest=open_interest_value,
-                    metadata=metadata,
-                )
-            )
+            row_data: Dict[str, Any] = {
+                "timestamp": str(timestamp_value),
+                "open": open_value,
+                "high": high_value,
+                "low": low_value,
+                "close": close_value,
+                "volume": volume_value,
+                "open_interest": open_interest_value,
+                "metadata": metadata,
+            }
+            row_data.update(metadata)
+            records.append(row_data)
 
-    logger.info("Loaded %d quotes from %s", len(records), path)
-    return records
+    metadata_columns = metadata_fields if metadata_fields is not None else []
+    base_columns = [
+        "timestamp",
+        "open",
+        "high",
+        "low",
+        "close",
+        "volume",
+        "open_interest",
+        "metadata",
+    ]
+    ordered_columns = list(dict.fromkeys(base_columns + metadata_columns))
+    dataframe = pd.DataFrame(records, columns=ordered_columns)
+
+    logger.info("Loaded %d quotes from %s", len(dataframe), path)
+    return dataframe
 
 
 # Register default loaders.
