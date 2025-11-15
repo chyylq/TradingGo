@@ -1,5 +1,6 @@
 ## Current Task
-- Outline architecture for fill analyzer module using agent reflection with LangGraph; input: trades with timestamps and historical quotes; output: rules generating those trades.
+- Completed: Fixed pending_revisions handling, simplified state management, made num_candidates configurable, updated status flow
+- Status: System is working correctly with all improvements implemented
 
 ## Plan
 - [x] Clarify key requirements and assumptions for fill analyzer module.
@@ -34,6 +35,14 @@
 - [x] Implement configurable quote loader and schema support.
 - [x] Fix evaluator prompt so recall/precision outputs use current iteration candidate labels instead of defaulting to `Candidate 1A` / `1B`.
 - [x] Validate lineage-aware candidate naming end-to-end and adjust reporting as needed.
+- [x] Fixed pending_revisions handling: cleared in draft node, rebuilt fresh in critic node per iteration
+- [x] Removed redundant "draft" field from critic's history entry (draft already in draft node's history)
+- [x] Made num_candidates a configurable parameter (CLI argument --num-candidates)
+- [x] Updated num_candidates logic: total includes revisions + new candidates
+- [x] Simplified lineage: removed redundant dictionary, derive on-demand from candidate names
+- [x] Fixed redundant state reads: candidate_statuses and evaluation_metrics now read once per node
+- [x] Updated status flow: "pending" is valid status, added "revised" status for parents
+- [x] Updated architecture.md with detailed agent data flow documentation
 
 ### Rule Schema Thoughts
 - Represent rule as `TradeRule` capturing `metadata`, `condition_tree`, `actions`, `confidence`, `metrics`, `notes`.
@@ -69,6 +78,14 @@
 - Quote summarization now trims to fill date range before prompting.
 - Reflection loop now estimates recall/precision via evaluator node, feeds metrics to critic, records in history/output. Heuristics context includes risk-reward guidance and note about missing `exit_date`.
 - Prompts revised so drafter labels multiple candidates, evaluator returns per-candidate metrics/issues, critic selects best candidate or targeted revisions.
+
+## Recent Improvements (Latest Session)
+- **Pending Revisions Fix**: Fixed bug where pending_revisions was always showing same IDs from iteration 1. Now cleared in draft node and rebuilt fresh in critic node based on current iteration's candidates with "revise" status.
+- **State Simplification**: Removed redundant lineage dictionary from state (derived on-demand from candidate names). Removed redundant "draft" field from critic's history entry.
+- **Configurable Candidates**: Made num_candidates a CLI parameter (--num-candidates). Total includes both revisions and new candidates.
+- **Status Flow Enhancement**: Added "pending" as valid status (can be set by critic), added "revised" status for parent candidates when revisions are created.
+- **Code Optimization**: Fixed redundant state reads (candidate_statuses, evaluation_metrics) to read once per node instead of multiple times.
+- **Documentation**: Updated architecture.md with detailed agent data flow showing inputs, LLM interactions, and outputs for each node.
 
 ## Next Refinements
 - Replace LLM-based recall/precision estimation with deterministic backtest metrics.

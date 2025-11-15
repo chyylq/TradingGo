@@ -13,6 +13,13 @@ from langgraph.graph import END, StateGraph
 from openai import OpenAI
 
 from ..utils import load_openai_credentials
+from .candidate_names import (
+    extract_candidate_sections,
+    extract_parent_from_name,
+    generate_candidate_names,
+    normalize_candidate_label,
+    replace_candidate_names_in_content,
+)
 from .prompts import (
     DEFAULT_DEMO_QUESTION,
     build_critic_prompt,
@@ -34,7 +41,9 @@ class ReflectionState(TypedDict, total=False):
     decision: Literal["continue", "accept"]
     history: list[dict[str, str]]
     evaluation_metrics: Dict[str, Any]
-    lineage: Dict[str, Optional[str]]
+    candidate_statuses: Dict[str, Literal["accepted", "revise", "pending", "revised"]]
+    accepted_candidates: list[str]
+    pending_revisions: list[str]
 
 
 def build_reflection_graph(
@@ -43,6 +52,7 @@ def build_reflection_graph(
     max_loops: int = 2,
     review_history: bool = False,
     min_loops: int = 1,
+    num_candidates: int = 2,
 ) -> StateGraph:
     """
     Construct a LangGraph state machine that drafts an answer and reflects on it.
@@ -66,7 +76,7 @@ def build_reflection_graph(
             return "No metrics available."
         lines = []
         for candidate in metrics.get("candidates", []):
-            name = candidate.get("name", "Candidate")
+            name = candidate.get("name", "ID")
             recall = _safe_float(candidate.get("recall"))
             precision = _safe_float(candidate.get("precision"))
             recall_str = "n/a" if recall is None else f"{recall:.3f}"
@@ -89,7 +99,7 @@ def build_reflection_graph(
             issues = candidate.get("issues") or []
             if not issues:
                 continue
-            lines.append(f"{candidate.get('name', 'Candidate')}:")
+            lines.append(f"{candidate.get('name', 'ID')}:")
             for issue in issues:
                 issue_type = issue.get("type", "unknown")
                 description = issue.get("description", "")
@@ -132,7 +142,7 @@ def build_reflection_graph(
         for idx, candidate in enumerate(parsed.get("candidates", [])):
             if not isinstance(candidate, dict):
                 continue
-            name = candidate.get("name") or f"Candidate {chr(ord('A') + idx)}"
+            name = candidate.get("name") or f"ID {chr(ord('A') + idx)}"
             recall = _safe_float(candidate.get("recall"))
             precision = _safe_float(candidate.get("precision"))
             notes = candidate.get("notes") or ""
@@ -190,11 +200,22 @@ def build_reflection_graph(
         iteration_label = str(state["loop_count"] + 1)
         pending_revisions = list(state.get("pending_revisions", []))
 
+        # Generate candidate names programmatically
+        # num_candidates is the TOTAL number of candidates (revisions + new)
+        # Calculate how many new candidates we need after accounting for revisions
+        num_revisions = len(pending_revisions)
+        num_new_candidates = max(0, num_candidates - num_revisions)
+        
+        expected_candidates = generate_candidate_names(
+            iteration_label=iteration_label,
+            num_new_candidates=num_new_candidates,
+            pending_revisions=pending_revisions,
+        )
+
         prompt = build_draft_prompt(
             question,
-            feedback,
-            iteration_label=iteration_label,
-            pending_revisions=pending_revisions,
+            expected_candidates,
+            feedback=feedback,
         )
         response = client.chat.completions.create(
             model=model,
@@ -205,61 +226,144 @@ def build_reflection_graph(
         )
         content = response.choices[0].message.content.strip()
 
-        # Parse candidate sections for lineage tracking and summaries
-        candidate_infos: list[Dict[str, Any]] = []
-        candidate_pattern = re.compile(
-            r"###\s+Candidate\s+([0-9A-Z|]+).*?(?=###\s+Candidate\s+[0-9A-Z|]+|\Z)",
-            re.DOTALL,
-        )
-        existing_lineage: Dict[str, Optional[str]] = dict(state.get("lineage", {}) or {})
-
-        def _strip_candidate_prefix(label: Optional[str]) -> Optional[str]:
-            if not label:
-                return None
-            cleaned = re.sub(r"^Candidate\s+", "", label, flags=re.IGNORECASE).strip()
-            parts = [part.strip().upper() for part in cleaned.split("|") if part.strip()]
-            return "|".join(parts) if parts else None
-
-        def _format_candidate(label: str) -> str:
-            return f"Candidate {label}"
-
-        for match in candidate_pattern.finditer(content):
-            candidate_block = match.group(0).strip()
-            raw_label = "|".join(
-                part.strip().upper() for part in match.group(1).split("|") if part.strip()
-            )
-            parent_match = re.search(
-                r"Parent:\s*(Candidate\s+[0-9A-Z|]+|None)", candidate_block, re.IGNORECASE
-            )
-            parent_label = None
-            if parent_match:
-                parent_token = parent_match.group(1).strip()
-                if parent_token.lower() != "none":
-                    parent_label = _strip_candidate_prefix(parent_token)
-            if parent_label is None and pending_revisions:
-                fallback_parent = _strip_candidate_prefix(pending_revisions.pop(0))
-                if fallback_parent:
-                    parent_label = fallback_parent
-
-            if "|" not in raw_label and parent_label:
-                chain_label = f"{raw_label}|{parent_label}"
+        # Parse JSON response (required format)
+        try:
+            # Try to extract JSON from response (might be wrapped in code blocks)
+            json_match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", content, re.DOTALL)
+            if json_match:
+                json_str = json_match.group(1)
             else:
-                chain_label = raw_label
+                # Try parsing the whole content as JSON
+                json_str = content
+            
+            # Clean control characters that might break JSON parsing
+            # Remove invalid control characters (JSON only allows \n, \r, \t when properly escaped)
+            # This is a workaround - ideally LLM should escape properly
+            json_str = re.sub(r'[\x00-\x08\x0B\x0C\x0E-\x1F]', '', json_str)
+            
+            parsed_json = json.loads(json_str)
+        except (json.JSONDecodeError, AttributeError) as e:
+            raise ValueError(
+                f"Failed to parse JSON response from drafter. "
+                f"Response must be in JSON format. Error: {e}\nResponse: {content[:1000]}"
+            )
 
-            parent_full_id = _format_candidate(parent_label) if parent_label else None
-            if parent_full_id and parent_full_id not in existing_lineage:
-                existing_lineage[parent_full_id] = None
+        if "candidates" not in parsed_json:
+            raise ValueError(
+                f"JSON response missing 'candidates' field. "
+                f"Response must include a 'candidates' array. Response: {content[:500]}"
+            )
 
-            candidate_full_id = _format_candidate(chain_label)
-            existing_lineage[candidate_full_id] = parent_full_id
+        # Parse JSON response
+        candidates_data = parsed_json.get("candidates", [])
+        extracted_sections = []
+        for cand in candidates_data:
+            if not isinstance(cand, dict):
+                continue
+            candidate_id = cand.get("id", "")
+            if not candidate_id:
+                continue
+            raw_label = normalize_candidate_label(candidate_id)
+            rule_text = cand.get("rule", "")
+            parent_from_json = cand.get("parent")
+            parent_str = parent_from_json if parent_from_json else "None"
+            extracted_sections.append({
+                "header": f"### {candidate_id}",
+                "content": f"### {candidate_id}\nParent: {parent_str}\n\n{rule_text}",
+                "raw_label": raw_label,
+                "parent": parent_from_json,  # Store for later use
+                "iteration": cand.get("iteration", iteration_label),  # Use from JSON or fallback
+            })
+
+        # Map extracted sections to expected candidate names
+        candidate_infos: list[Dict[str, Any]] = []
+        name_mapping: Dict[str, str] = {}  # old_name -> new_name for replacement
+        used_expected_indices: set[int] = set()  # Track which expected candidates we've used
+        final_candidate_names: list[str] = []  # Track all final candidate names for lineage
+        
+        # Read candidate_statuses once at the beginning (used in two places)
+        candidate_statuses = dict(state.get("candidate_statuses", {}))
+
+        # Create a mapping from normalized labels to expected candidate names
+        expected_by_label: Dict[str, tuple[str, Optional[str], int]] = {}
+        for idx, (candidate_name, parent_name) in enumerate(expected_candidates):
+            label = normalize_candidate_label(candidate_name)
+            expected_by_label[label] = (candidate_name, parent_name, idx)
+
+        # Process extracted sections and match to expected names
+        # Process in order: assign each LLM response to the next unused expected candidate
+        for section_idx, section in enumerate(extracted_sections):
+            raw_label = section["raw_label"]
+            normalized = normalize_candidate_label(raw_label)
+            candidate_block = section["content"]
+            llm_name = f"ID {raw_label}"
+            
+            # Get parent and iteration from JSON if available
+            json_parent = section.get("parent")
+            json_iteration = section.get("iteration", iteration_label)
+
+            # Find the next unused expected candidate
+            candidate_name = None
+            parent_name = None
+            expected_idx = None
+            
+            # First, try to match by normalized label (in case LLM used correct name)
+            if normalized in expected_by_label:
+                candidate_name, parent_name, expected_idx = expected_by_label[normalized]
+                if expected_idx in used_expected_indices:
+                    # Already used, need to find next unused
+                    candidate_name = None
+                else:
+                    used_expected_indices.add(expected_idx)
+                    # Use parent from expected (not JSON) to ensure correct lineage
+                    # Only use JSON parent if it matches expected
+                    if json_parent:
+                        json_parent_norm = normalize_candidate_label(json_parent)
+                        expected_parent_norm = normalize_candidate_label(parent_name) if parent_name else None
+                        if json_parent_norm != expected_parent_norm:
+                            # JSON parent doesn't match expected, use expected parent
+                            pass  # parent_name already set from expected
+            
+            # If no match or already used, assign to next unused expected candidate
+            if candidate_name is None:
+                for idx, (exp_name, exp_parent) in enumerate(expected_candidates):
+                    if idx not in used_expected_indices:
+                        candidate_name, parent_name = exp_name, exp_parent
+                        expected_idx = idx
+                        used_expected_indices.add(idx)
+                        break
+                
+                # If all expected candidates are used, this is an error
+                if candidate_name is None:
+                    raise ValueError(
+                        f"LLM returned more candidates than expected. "
+                        f"Expected {len(expected_candidates)} candidates but got {len(extracted_sections)}. "
+                        f"Expected: {[c[0] for c in expected_candidates]}"
+                    )
+            
+            # Always use expected parent (not JSON parent) to ensure correct lineage
+            # The LLM might return wrong parent info, so we trust the programmatically generated names
+            if llm_name != candidate_name:
+                name_mapping[llm_name] = candidate_name
+
+            final_candidate_names.append(candidate_name)
+
+            # Get status for candidate_infos (use the candidate_statuses we already read)
+            candidate_status = candidate_statuses.get(candidate_name, "pending")
+
             candidate_infos.append(
                 {
-                    "id": candidate_full_id,
-                    "parent": parent_full_id,
-                    "iteration": iteration_label,
+                    "id": candidate_name,
+                    "parent": parent_name,
+                    "iteration": json_iteration,  # Use iteration from JSON
                     "text": candidate_block,
+                    "status": candidate_status,
                 }
             )
+
+        # Replace any mismatched names in content
+        if name_mapping:
+            content = replace_candidate_names_in_content(content, name_mapping)
 
         new_history = history + [
             {
@@ -270,14 +374,35 @@ def build_reflection_graph(
                 "candidates": candidate_infos,
             }
         ]
+        # Initialize candidate statuses for new candidates (already read above)
+        # Track which parents we've marked as revised (to avoid duplicates)
+        revised_parents = set()
+        
+        for candidate_name in final_candidate_names:
+            # New candidates default to "pending" status
+            if candidate_name not in candidate_statuses:
+                candidate_statuses[candidate_name] = "pending"
+            
+            # If this is a revision (has a parent), mark the parent as "revised"
+            # Extract parent on-demand from candidate name
+            parent_id = extract_parent_from_name(candidate_name)
+            if parent_id and parent_id not in revised_parents:
+                # Only mark as "revised" if parent was previously "revise"
+                if candidate_statuses.get(parent_id) == "revise":
+                    candidate_statuses[parent_id] = "revised"
+                    revised_parents.add(parent_id)
+
+        # Clear pending_revisions in draft node - we're creating revisions now
+        # The critic will rebuild it based on the current iteration's candidates
+        
         return {
             "question": question,
             "draft_answer": content,
             "critic_feedback": feedback,
             "loop_count": state["loop_count"] + 1,
             "history": new_history,
-            "lineage": existing_lineage,
-            "pending_revisions": pending_revisions,
+            "pending_revisions": [],  # Clear pending_revisions - critic will rebuild it
+            "candidate_statuses": candidate_statuses,
         }
 
     def evaluate_draft(state: ReflectionState) -> ReflectionState:
@@ -301,13 +426,39 @@ def build_reflection_graph(
             "history": history,
             "evaluation_metrics": metrics,
             "pending_revisions": state.get("pending_revisions", []),
-            "lineage": state.get("lineage", {}),
+            "candidate_statuses": state.get("candidate_statuses", {}),
         }
 
     def critic_review(state: ReflectionState) -> ReflectionState:
+        """
+        Critic reviews candidates and assigns statuses.
+        
+        Information the critic sees:
+        1. draft_answer: Full text of all candidates, including their complete rule descriptions:
+           - Entry rules (long/short entry conditions, technical indicators, parameters)
+           - Exit rules (long/short exit conditions, risk management)
+           - Risk controls (stops, targets, position sizing)
+           - Technical theme and supporting indicators
+           - Assumptions and parameter ranges
+        2. metrics_summary: Per-candidate evaluation metrics (recall, precision, notes)
+           formatted as: "ID 1A: Recall=0.850, Precision=0.720, Notes=..."
+        3. issues_summary: Per-candidate issues and suggestions from evaluator, formatted as:
+           "ID 1A:
+             - (recall) issue description | Suggestion: how to fix
+             - (precision) issue description | Suggestion: how to fix"
+        4. history_summary: Prior evaluation summaries from previous iterations (only if
+           review_history enabled)
+        5. question: The original rule discovery question/context
+        
+        The critic makes decisions based on: (1) the actual rule content, (2) metrics,
+        (3) issues/suggestions, and (4) whether suggestions align with and can improve
+        the rules. It then assigns statuses (ACCEPTED, REVISE, PENDING) to each candidate.
+        """
         _ensure_loop_count(state)
-        metrics_summary = _format_metrics(state.get("evaluation_metrics"))
-        issues_summary = _format_issues(state.get("evaluation_metrics"))
+        # Read evaluation_metrics once (used for both metrics_summary and issues_summary)
+        evaluation_metrics = state.get("evaluation_metrics")
+        metrics_summary = _format_metrics(evaluation_metrics)
+        issues_summary = _format_issues(evaluation_metrics)
         history_summary = _summarize_prior_evaluations(
             state.get("history", []), state.get("loop_count", 0)
         )
@@ -332,18 +483,103 @@ def build_reflection_graph(
         )
         feedback = response.choices[0].message.content.strip()
         history = state.get("history", [])
+        
+        # Parse per-candidate statuses from critic feedback
+        candidate_statuses = dict(state.get("candidate_statuses", {}))
+        # Build fresh pending_revisions list from current iteration's candidates with "revise" status
+        pending_revisions: list[str] = []
+        accepted_candidates = []
+        parsed_json = None
+        
+        if feedback:
+            # Parse JSON response (required format)
+            try:
+                # Try to extract JSON from response (might be wrapped in code blocks)
+                json_match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", feedback, re.DOTALL)
+                if json_match:
+                    json_str = json_match.group(1)
+                else:
+                    # Try parsing the whole content as JSON
+                    json_str = feedback
+                
+                # Clean control characters that might break JSON parsing
+                # Remove invalid control characters (JSON only allows \n, \r, \t when properly escaped)
+                json_str = re.sub(r'[\x00-\x08\x0B\x0C\x0E-\x1F]', '', json_str)
+                
+                parsed_json = json.loads(json_str)
+            except (json.JSONDecodeError, AttributeError) as e:
+                raise ValueError(
+                    f"Failed to parse JSON response from critic. "
+                    f"Response must be in JSON format. Error: {e}\nResponse: {feedback[:500]}"
+                )
+            
+            if "candidates" not in parsed_json:
+                raise ValueError(
+                    f"JSON response missing 'candidates' field. "
+                    f"Response must include a 'candidates' array. Response: {feedback[:500]}"
+                )
+            
+            # Parse JSON response
+            # Extract overall decision and reason
+            overall_decision = parsed_json.get("decision", "").strip().upper()
+            overall_reason = parsed_json.get("reason", "")
+            
+            # Prepend overall decision/reason to feedback for consistency
+            if overall_decision or overall_reason:
+                decision_text = f"Decision: {overall_decision}\nReason: {overall_reason}\n\n"
+                if not feedback.startswith(decision_text):
+                    feedback = decision_text + feedback
+            
+            candidates_data = parsed_json.get("candidates", [])
+            for cand in candidates_data:
+                if not isinstance(cand, dict):
+                    continue
+                candidate_id = cand.get("id", "").strip()
+                if not candidate_id:
+                    continue
+                
+                status_str = cand.get("status", "").strip().upper()
+                
+                # Map to our status values
+                # Critic can provide ACCEPTED, REVISE, or PENDING
+                if status_str == "ACCEPTED":
+                    status = "accepted"
+                    accepted_candidates.append(candidate_id)
+                elif status_str == "REVISE":
+                    status = "revise"
+                    # Only add to pending_revisions if it's a "revise" status (not "pending")
+                    if candidate_id not in accepted_candidates:
+                        pending_revisions.append(candidate_id)
+                elif status_str == "PENDING":
+                    status = "pending"
+                    # Don't add to pending_revisions - "pending" means keep as-is, not ready for revision
+                else:  # Invalid status - default to PENDING
+                    status = "pending"
+                    # Log warning for debugging
+                    import warnings
+                    warnings.warn(
+                        f"Critic returned invalid status '{status_str}' for candidate {candidate_id}. "
+                        f"Expected ACCEPTED, REVISE, or PENDING. Defaulting to PENDING."
+                    )                    
+                
+                # Update status (but don't override 'accepted' with other statuses)
+                if candidate_id not in candidate_statuses or candidate_statuses[candidate_id] != "accepted":
+                    candidate_statuses[candidate_id] = status
+        
+        # pending_revisions now only contains candidates from current iteration with "revise" status
+        # (accepted candidates were never added, so no need to filter them out)
+        
         new_history = history + [
             {
-                "draft": state["draft_answer"],
                 "feedback": feedback,
                 "phase": "critic",
                 "loop": str(state.get("loop_count", 0)),
+                "candidate_statuses": dict(candidate_statuses),  # Store in history for debugging
+                "parsed_json": parsed_json,  # Store parsed JSON for easier access
+                "pending_revisions": list(pending_revisions),  # Store pending revisions for this iteration
             }
         ]
-        pending_revisions = []
-        if feedback:
-            candidate_refs = re.findall(r"Candidate\s+[0-9A-Z|]+", feedback)
-            pending_revisions = list(dict.fromkeys(candidate_refs))
+        
         return {
             "question": state["question"],
             "draft_answer": state["draft_answer"],
@@ -352,22 +588,33 @@ def build_reflection_graph(
             "history": new_history,
             "evaluation_metrics": state.get("evaluation_metrics"),
             "pending_revisions": pending_revisions,
-            "lineage": state.get("lineage", {}),
+            "candidate_statuses": candidate_statuses,
         }
 
     decision_pattern = re.compile(r"decision:\s*(accept|revise)", re.IGNORECASE)
 
     def route_decision(state: ReflectionState) -> ReflectionState:
         feedback = state.get("critic_feedback", "")
-        match = decision_pattern.search(feedback)
-        decision: Literal["continue", "accept"]
+        candidate_statuses = state.get("candidate_statuses", {})
         current_loop = state.get("loop_count", 0)
-        if match and match.group(1).lower() == "accept" and current_loop >= min_loops:
+        
+        # Check if any candidate is accepted
+        has_accepted = any(
+            status == "accepted" for status in candidate_statuses.values()
+        )
+        
+        decision: Literal["continue", "accept"]
+        # Accept if: (1) we have accepted candidates AND min_loops reached, OR
+        #            (2) we've reached max_loops
+        if has_accepted and current_loop >= min_loops:
             decision = "accept"
-        elif current_loop >= max_loops and state.get("decision") != "accept":
+        elif current_loop >= max_loops:
             decision = "accept"
         else:
             decision = "continue"
+        
+        route_pending_revisions = state.get("pending_revisions", [])
+        
         return {
             "question": state["question"],
             "draft_answer": state["draft_answer"],
@@ -376,11 +623,19 @@ def build_reflection_graph(
             "decision": decision,
             "history": state.get("history", []),
             "evaluation_metrics": state.get("evaluation_metrics"),
-            "pending_revisions": state.get("pending_revisions", []),
-            "lineage": state.get("lineage", {}),
+            "pending_revisions": route_pending_revisions,
+            "candidate_statuses": candidate_statuses,
         }
 
     def finalize(state: ReflectionState) -> ReflectionState:
+        candidate_statuses = state.get("candidate_statuses", {})
+        # Find all accepted candidates
+        accepted_candidates = [
+            candidate_id
+            for candidate_id, status in candidate_statuses.items()
+            if status == "accepted"
+        ]
+        
         return {
             "question": state["question"],
             "draft_answer": state["draft_answer"],
@@ -389,7 +644,9 @@ def build_reflection_graph(
             "final_answer": state["draft_answer"],
             "history": state.get("history", []),
             "evaluation_metrics": state.get("evaluation_metrics"),
-            "lineage": state.get("lineage", {}),
+            "candidate_statuses": candidate_statuses,
+            "accepted_candidates": accepted_candidates,  # Add for easy access
+            "pending_revisions": state.get("pending_revisions", []),  # Add for easy access
         }
 
     graph.add_node("draft_response", draft_response)
@@ -440,6 +697,7 @@ def run_reflection_demo(
     max_loops: int = 2,
     review_history: bool = False,
     min_loops: int = 1,
+    num_candidates: int = 2,
 ) -> ReflectionState:
     """
     Execute the reflection graph on a single question and return the final state.
@@ -455,13 +713,15 @@ def run_reflection_demo(
         max_loops=max_loops,
         review_history=review_history,
         min_loops=min_loops,
+        num_candidates=num_candidates,
     )
     chain = graph.compile()
     initial_question = question or DEFAULT_DEMO_QUESTION
     initial_state: ReflectionState = {
         "question": initial_question,
         "loop_count": 0,
-        "lineage": {},
+        "candidate_statuses": {},
+        "pending_revisions": [],
     }
     result = chain.invoke(initial_state)
     return result
