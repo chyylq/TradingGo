@@ -199,6 +199,29 @@ def build_reflection_graph(
         history = state.get("history", [])
         iteration_label = str(state["loop_count"] + 1)
         pending_revisions = list(state.get("pending_revisions", []))
+        current_loop = state.get("loop_count", 0)
+
+        # Extract most recent evaluation metrics and issues from history
+        # Look for evaluation from previous iteration (current_loop - 1) or most recent
+        metrics_summary = None
+        issues_summary = None
+        if history and current_loop > 0:
+            # Find evaluation from previous iteration
+            for entry in reversed(history):
+                if entry.get("phase") == "evaluation":
+                    entry_loop = entry.get("loop")
+                    try:
+                        entry_loop_int = int(entry_loop) if entry_loop else -1
+                    except (TypeError, ValueError):
+                        entry_loop_int = -1
+                    # Get evaluation from previous iteration (current_loop - 1)
+                    if entry_loop_int == current_loop - 1:
+                        metrics_summary = entry.get("metrics")
+                        issues_summary = entry.get("issues")
+                        break
+                    # If we're past the previous iteration, stop (we want most recent before current)
+                    elif entry_loop_int < current_loop - 1:
+                        break
 
         # Generate candidate names programmatically
         # num_candidates is the TOTAL number of candidates (revisions + new)
@@ -216,6 +239,8 @@ def build_reflection_graph(
             question,
             expected_candidates,
             feedback=feedback,
+            metrics_summary=metrics_summary,
+            issues_summary=issues_summary,
         )
         response = client.chat.completions.create(
             model=model,
